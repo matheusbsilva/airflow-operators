@@ -85,7 +85,7 @@ class PostgresCopyTable(BaseOperator):
         local_storage_path: str = '/tmp/airflow_postgres_copy',
         source_schema: str = 'public',
         target_schema: str = 'public',
-        if_exists: Literal['replace', 'truncate'] = 'replace',
+        if_exists: Literal[*_VALID_IF_EXISTS] = 'replace',
         exclude_columns: Optional[List[str]] = None,
         **kwargs
     ) -> None:
@@ -103,7 +103,6 @@ class PostgresCopyTable(BaseOperator):
         self.local_storage_path = local_storage_path
 
     def execute(self, context):
-        # Validate inputs after template rendering
         if self.if_exists not in self._VALID_IF_EXISTS:
             raise AirflowException(
                 f"Invalid value for if_exists: '{self.if_exists}'. Must be one of {self._VALID_IF_EXISTS}."
