@@ -154,6 +154,12 @@ class PostgresCopyTable(BaseOperator):
         self._attach_database(conn, target_hook.get_uri(), self.target_schema, self._TARGET_DB)
         self._create_table(conn, storage_filepath)
 
+        if self.if_exists == 'truncate':
+            target_table_path = f'{self._TARGET_DB}.{self.target_table}'
+            self._sync_table_schema(conn, target_table_path, storage_filepath)
+            self.log.info(f"Truncating table {target_table_path}")
+            conn.execute(f'TRUNCATE {target_table_path}')
+
         self.log.info(f"Inserting values from {storage_filepath} to {self.target_table}")
 
         conn.execute(f"""
@@ -174,22 +180,11 @@ class PostgresCopyTable(BaseOperator):
                 WITH NO DATA
             """)
         elif self.if_exists == 'truncate':
-            try:
-                self._sync_table_schema(conn, target_table_path, storage_filepath)
-
-                self.log.info(f"Truncating table {target_table_path}")
-
-                conn.execute(f'TRUNCATE {target_table_path}')
-            except duckdb.CatalogException as err:
-                self.log.warning(err)
-
-                self.log.info(f'Creating table {target_table_path}')
-
-                conn.execute(f"""
-                    CREATE TABLE {target_table_path} AS
-                    SELECT * FROM '{storage_filepath}'
-                    WITH NO DATA
-                """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {target_table_path} AS
+                SELECT * FROM '{storage_filepath}'
+                WITH NO DATA
+            """)
 
     def _copy_source_to_storage(
         self,
