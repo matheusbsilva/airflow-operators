@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional
+from typing import Callable, List, Literal, Optional
 import os
 from pathlib import Path
 
@@ -8,6 +8,70 @@ from airflow.exceptions import AirflowException
 from airflow.models.baseoperator import BaseOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+try:
+    from typing import Protocol
+except ImportError:
+    from typing_extensions import Protocol
+
+
+class WriteStrategy(Protocol):
+    def write(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        target_table_path: str,
+        storage_filepath: str,
+    ) -> None: ...
+
+
+class ReplaceStrategy:
+    def __init__(self, log) -> None:
+        self._log = log
+
+    def write(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        target_table_path: str,
+        storage_filepath: str,
+    ) -> None:
+        conn.execute(f"""
+            CREATE OR REPLACE TABLE {target_table_path} AS
+            SELECT * FROM '{storage_filepath}'
+            WITH NO DATA
+        """)
+        self._log.info(f"Inserting values from {storage_filepath} into {target_table_path}")
+        conn.execute(f"""
+            INSERT INTO {target_table_path} BY NAME (
+                SELECT * FROM '{storage_filepath}'
+            )
+        """)
+
+
+class TruncateStrategy:
+    def __init__(self, log, sync_fn: Callable) -> None:
+        self._log = log
+        self._sync_fn = sync_fn
+
+    def write(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        target_table_path: str,
+        storage_filepath: str,
+    ) -> None:
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {target_table_path} AS
+            SELECT * FROM '{storage_filepath}'
+            WITH NO DATA
+        """)
+        self._sync_fn(conn, target_table_path, storage_filepath)
+        self._log.info(f"Truncating table {target_table_path}")
+        conn.execute(f'TRUNCATE {target_table_path}')
+        self._log.info(f"Inserting values from {storage_filepath} into {target_table_path}")
+        conn.execute(f"""
+            INSERT INTO {target_table_path} BY NAME (
+                SELECT * FROM '{storage_filepath}'
+            )
+        """)
 
 
 class PostgresCopyTable(BaseOperator):
@@ -152,39 +216,16 @@ class PostgresCopyTable(BaseOperator):
         use_s3: bool,
     ) -> None:
         self._attach_database(conn, target_hook.get_uri(), self.target_schema, self._TARGET_DB)
-        self._create_table(conn, storage_filepath)
 
-        if self.if_exists == 'truncate':
-            target_table_path = f'{self._TARGET_DB}.{self.target_table}'
-            self._sync_table_schema(conn, target_table_path, storage_filepath)
-            self.log.info(f"Truncating table {target_table_path}")
-            conn.execute(f'TRUNCATE {target_table_path}')
-
-        self.log.info(f"Inserting values from {storage_filepath} to {self.target_table}")
-
-        conn.execute(f"""
-            INSERT INTO {self._TARGET_DB}.{self.target_table} BY NAME (
-                SELECT * FROM '{storage_filepath}'
-            )
-        """)
+        target_table_path = f'{self._TARGET_DB}.{self.target_table}'
+        self._get_strategy().write(conn, target_table_path, storage_filepath)
 
         self._detach_database(conn, self._TARGET_DB)
 
-    def _create_table(self, conn: duckdb.DuckDBPyConnection, storage_filepath: str) -> None:
-        target_table_path = f'{self._TARGET_DB}.{self.target_table}'
-
+    def _get_strategy(self) -> WriteStrategy:
         if self.if_exists == 'replace':
-            conn.execute(f"""
-                CREATE OR REPLACE TABLE {target_table_path} AS
-                SELECT * FROM '{storage_filepath}'
-                WITH NO DATA
-            """)
-        elif self.if_exists == 'truncate':
-            conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS {target_table_path} AS
-                SELECT * FROM '{storage_filepath}'
-                WITH NO DATA
-            """)
+            return ReplaceStrategy(self.log)
+        return TruncateStrategy(self.log, self._sync_table_schema)
 
     def _copy_source_to_storage(
         self,
