@@ -1,9 +1,10 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 import os
 from pathlib import Path
 
 import duckdb
 
+from airflow.exceptions import AirflowException
 from airflow.models.baseoperator import BaseOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -54,8 +55,24 @@ class PostgresCopyTable(BaseOperator):
         Defaults to '/tmp/airflow_postgres_copy'. Only used when aws_conn_id is not provided.
     :type local_storage_path: str
     """
-    template_fields = ('aws_conn_id', 'source_conn_id', 'target_conn_id', 'exclude_columns',
-                       'source_table', 'target_table', 'if_exists', 'bucket_uri', 'local_storage_path')
+
+    template_fields = (
+        'source_conn_id',
+        'target_conn_id',
+        'source_table',
+        'target_table',
+        'source_schema',
+        'target_schema',
+        'if_exists',
+        'exclude_columns',
+        'aws_conn_id',
+        'bucket_uri',
+        'local_storage_path',
+    )
+
+    _SOURCE_DB = 'source_db'
+    _TARGET_DB = 'target_db'
+    _VALID_IF_EXISTS = ('replace', 'truncate')
 
     def __init__(
         self,
@@ -68,140 +85,147 @@ class PostgresCopyTable(BaseOperator):
         local_storage_path: str = '/tmp/airflow_postgres_copy',
         source_schema: str = 'public',
         target_schema: str = 'public',
-        if_exists: str = 'replace',
-        exclude_columns: List[str] = [],
+        if_exists: Literal['replace', 'truncate'] = 'replace',
+        exclude_columns: Optional[List[str]] = None,
         **kwargs
     ) -> None:
         super().__init__(**kwargs)
         self.source_conn_id = source_conn_id
         self.target_conn_id = target_conn_id
-        self.loaded_source_db = f'source_db'
-        self.loaded_target_db = f'target_db'
         self.source_table = source_table
         self.target_table = target_table
         self.source_schema = source_schema
         self.target_schema = target_schema
         self.if_exists = if_exists
-        self.exclude_columns = exclude_columns
+        self.exclude_columns = exclude_columns or []
         self.aws_conn_id = aws_conn_id
         self.bucket_uri = bucket_uri
         self.local_storage_path = local_storage_path
 
-        # Determine storage mode
-        self.use_s3 = aws_conn_id is not None
-
-        if self.use_s3:
-            if not bucket_uri:
-                raise ValueError("bucket_uri is required when aws_conn_id is provided")
-            self.storage_filepath = f'{self.bucket_uri}/{self.source_table}.parquet'
-            self.s3_hook = self.load_s3_conn(aws_conn_id)
-        else:
-            # Use local storage
-            Path(self.local_storage_path).mkdir(parents=True, exist_ok=True)
-            self.storage_filepath = os.path.join(self.local_storage_path, f'{self.source_table}.parquet')
-
-        self.source_hook = self.load_postgres_conn(source_conn_id)
-        self.target_hook = self.load_postgres_conn(target_conn_id)
-        self.source_query = self.build_source_query()
-
     def execute(self, context):
-        with duckdb.connect() as duckdb_conn:
-            duckdb_conn.execute('INSTALL postgres; LOAD postgres;')
+        # Validate inputs after template rendering
+        if self.if_exists not in self._VALID_IF_EXISTS:
+            raise AirflowException(
+                f"Invalid value for if_exists: '{self.if_exists}'. Must be one of {self._VALID_IF_EXISTS}."
+            )
 
-            self.extract(duckdb_conn)
+        use_s3 = self.aws_conn_id is not None
 
-            self.load(duckdb_conn)
+        if use_s3:
+            if not self.bucket_uri:
+                raise AirflowException("bucket_uri is required when aws_conn_id is provided")
+            storage_filepath = f'{self.bucket_uri}/{self.source_table}.parquet'
+        else:
+            Path(self.local_storage_path).mkdir(parents=True, exist_ok=True)
+            storage_filepath = os.path.join(self.local_storage_path, f'{self.source_table}.parquet')
 
-            # Cleanup local file if using local storage
-            if not self.use_s3:
-                self.cleanup_local_file()
+        source_hook = PostgresHook(postgres_conn_id=self.source_conn_id)
+        target_hook = PostgresHook(postgres_conn_id=self.target_conn_id)
+        source_query = self._build_source_query()
 
-    def extract(self, conn: duckdb.DuckDBPyConnection):
-        self.attach_database(
-            conn,
-            self.source_hook.get_uri(),
-            self.source_schema,
-            self.loaded_source_db,
-        )
+        try:
+            with duckdb.connect() as duckdb_conn:
+                duckdb_conn.execute('INSTALL postgres; LOAD postgres;')
 
-        self.copy_source_to_storage(conn)
+                self._extract(duckdb_conn, source_hook, source_query, storage_filepath, use_s3)
+                self._load(duckdb_conn, target_hook, storage_filepath, use_s3)
+        finally:
+            if not use_s3:
+                self._cleanup_local_file(storage_filepath)
 
-        self.detach_database(conn, self.loaded_source_db)
+    def _extract(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_hook: PostgresHook,
+        source_query: str,
+        storage_filepath: str,
+        use_s3: bool,
+    ) -> None:
+        self._attach_database(conn, source_hook.get_uri(), self.source_schema, self._SOURCE_DB)
+        self._copy_source_to_storage(conn, source_query, storage_filepath, use_s3)
+        self._detach_database(conn, self._SOURCE_DB)
 
-    def load(self, conn: duckdb.DuckDBPyConnection):
-        self.attach_database(
-            conn,
-            self.target_hook.get_uri(),
-            self.target_schema,
-            self.loaded_target_db
-        )
+    def _load(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        target_hook: PostgresHook,
+        storage_filepath: str,
+        use_s3: bool,
+    ) -> None:
+        self._attach_database(conn, target_hook.get_uri(), self.target_schema, self._TARGET_DB)
+        self._create_table(conn, storage_filepath)
 
-        self.create_table(conn)
-
-        self.log.info(f"Inserting values from {self.storage_filepath} to {self.target_table}")
+        self.log.info(f"Inserting values from {storage_filepath} to {self.target_table}")
 
         conn.execute(f"""
-            INSERT INTO {self.loaded_target_db}.{self.target_table} BY NAME (
-                SELECT * FROM '{self.storage_filepath}'
+            INSERT INTO {self._TARGET_DB}.{self.target_table} BY NAME (
+                SELECT * FROM '{storage_filepath}'
             )
         """)
 
-        self.detach_database(conn, self.loaded_target_db)
+        self._detach_database(conn, self._TARGET_DB)
 
-    def create_table(self, conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
-        target_table_path = f'{self.loaded_target_db}.{self.target_table}'
+    def _create_table(self, conn: duckdb.DuckDBPyConnection, storage_filepath: str) -> None:
+        target_table_path = f'{self._TARGET_DB}.{self.target_table}'
 
         if self.if_exists == 'replace':
             conn.execute(f"""
                 CREATE OR REPLACE TABLE {target_table_path} AS
-                SELECT * FROM '{self.storage_filepath}'
+                SELECT * FROM '{storage_filepath}'
                 WITH NO DATA
             """)
-
-        if self.if_exists == 'truncate':
+        elif self.if_exists == 'truncate':
             try:
-                self.sync_table_schema(conn, target_table_path)
+                self._sync_table_schema(conn, target_table_path, storage_filepath)
 
                 self.log.info(f"Truncating table {target_table_path}")
 
                 conn.execute(f'TRUNCATE {target_table_path}')
             except duckdb.CatalogException as err:
-                self.log.warn(err)
+                self.log.warning(err)
 
                 self.log.info(f'Creating table {target_table_path}')
 
                 conn.execute(f"""
                     CREATE TABLE {target_table_path} AS
-                    SELECT * FROM '{self.storage_filepath}'
+                    SELECT * FROM '{storage_filepath}'
                     WITH NO DATA
                 """)
 
-    def copy_source_to_storage(self, conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
-        if self.use_s3:
-            self.attach_s3(conn)
+    def _copy_source_to_storage(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_query: str,
+        storage_filepath: str,
+        use_s3: bool,
+    ) -> None:
+        if use_s3:
+            self._attach_s3(conn)
 
-        storage_type = "S3" if self.use_s3 else "local storage"
-        self.log.info(f"Copying data from {self.source_table} to {storage_type}: {self.storage_filepath}")
+        storage_type = "S3" if use_s3 else "local storage"
+        self.log.info(f"Copying data from {self.source_table} to {storage_type}: {storage_filepath}")
 
         conn.execute(f"""
-            COPY ({self.source_query}) TO '{self.storage_filepath}' (
+            COPY ({source_query}) TO '{storage_filepath}' (
                 FORMAT parquet,
                 COMPRESSION zstd
             )
         """)
 
-        return conn
-
-    def build_source_query(self) -> str:
+    def _build_source_query(self) -> str:
         if self.exclude_columns:
             columns = ','.join(self.exclude_columns)
+            return f'SELECT * EXCLUDE({columns}) FROM {self._SOURCE_DB}.{self.source_table}'
 
-            return f'SELECT * EXCLUDE({columns}) FROM {self.loaded_source_db}.{self.source_table}'
+        return f'SELECT * FROM {self._SOURCE_DB}.{self.source_table}'
 
-        return f'SELECT * FROM {self.loaded_source_db}.{self.source_table}'
-
-    def sync_table_schema(self, conn: duckdb.DuckDBPyConnection, target_table: str) -> duckdb.DuckDBPyConnection:
-        source_cols_desc = conn.execute(f"DESCRIBE '{self.storage_filepath}'").fetchall()
+    def _sync_table_schema(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        target_table: str,
+        storage_filepath: str,
+    ) -> None:
+        source_cols_desc = conn.execute(f"DESCRIBE '{storage_filepath}'").fetchall()
         target_cols_desc = conn.execute(f"DESCRIBE {target_table}").fetchall()
 
         source_columns = {col[0]: col[1] for col in source_cols_desc}
@@ -213,38 +237,29 @@ class PostgresCopyTable(BaseOperator):
 
         for col_name, col_type in columns_to_add.items():
             self.log.info(f"Adding column '{col_name}' with type '{col_type}' to table '{target_table}'")
-
             conn.execute(f'ALTER TABLE {target_table} ADD COLUMN "{col_name}" {col_type}')
 
-        return conn
-
-    def attach_database(
+    def _attach_database(
         self,
         conn: duckdb.DuckDBPyConnection,
         db_uri: str,
         db_schema: str,
         loaded_db_name: str,
-    ) -> duckdb.DuckDBPyConnection:
+    ) -> None:
         conn.execute(f"""
             ATTACH '{db_uri}' AS
             {loaded_db_name} (TYPE postgres, SCHEMA '{db_schema}')
         """)
 
-        return conn
+    def _detach_database(self, conn: duckdb.DuckDBPyConnection, loaded_db_name: str) -> None:
+        conn.execute(f'DETACH DATABASE {loaded_db_name}')
 
-    def detach_database(self, conn: duckdb.DuckDBPyConnection, loaded_db_name: str):
-        conn.execute(f"""
-            DETACH DATABASE {loaded_db_name}
-        """)
-
-        return conn
-
-    def attach_s3(self, conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
-
+    def _attach_s3(self, conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute('INSTALL httpfs; LOAD httpfs;')
 
-        region_name = self.s3_hook.region_name
-        credentials = self.s3_hook.get_credentials()
+        s3_hook = S3Hook(aws_conn_id=self.aws_conn_id)
+        region_name = s3_hook.region_name
+        credentials = s3_hook.get_credentials()
 
         conn.execute(f"""
             CREATE SECRET (
@@ -255,23 +270,10 @@ class PostgresCopyTable(BaseOperator):
             );
         """)
 
-        return conn
-
-    def cleanup_local_file(self):
-        """Remove the local parquet file after successful load."""
+    def _cleanup_local_file(self, storage_filepath: str) -> None:
         try:
-            if os.path.exists(self.storage_filepath):
-                os.remove(self.storage_filepath)
-                self.log.info(f"Cleaned up local file: {self.storage_filepath}")
-        except Exception as e:
-            self.log.warning(f"Failed to cleanup local file {self.storage_filepath}: {e}")
-
-    def load_postgres_conn(self, conn_id: str) -> PostgresHook:
-        hook = PostgresHook(postgres_conn_id=conn_id)
-
-        return hook
-
-    def load_s3_conn(self, conn_id: str) -> S3Hook:
-        hook = S3Hook(aws_conn_id=conn_id)
-
-        return hook
+            if os.path.exists(storage_filepath):
+                os.remove(storage_filepath)
+                self.log.info(f"Cleaned up local file: {storage_filepath}")
+        except OSError as e:
+            self.log.warning(f"Failed to cleanup local file {storage_filepath}: {e}")
