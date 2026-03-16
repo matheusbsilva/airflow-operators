@@ -1,0 +1,43 @@
+# DLT Postgres Copy Table Configuration
+#
+# Structure:
+#   <airflow_connection_name>:        # Airflow connection ID for the source PostgreSQL database
+#     - table: <table_name>           # Source (and destination) table name
+#       incremental_key: <col>        # Optional. Enables incremental load (dlt merge/delete+insert).
+#                                     # Must be a timestamp/datetime column. Omit for full refresh.
+#       primary_key: <col>            # Optional. Used for merge deduplication. Defaults to 'id'.
+#       exclude_columns:              # Optional. Columns to omit from the copy.
+#         - <column_name>
+#
+# Notes:
+#   - Tables with `incremental_key` use dlt's delete+insert merge strategy.
+#     State (last cursor value) is stored atomically in the destination DB.
+#   - Tables without `incremental_key` perform a full replace on every run.
+#   - The destination table name always matches the source table name.
+#   - JSONB columns are automatically detected and preserved as JSONB in the destination.
+
+source_postgres_conn:
+  - table: orders
+    incremental_key: updated_at
+    primary_key: id
+    exclude_columns:
+      - internal_notes
+
+  - table: customers
+    incremental_key: updated_at
+    primary_key: id
+
+  - table: products
+    incremental_key: updated_at
+    primary_key: id
+    exclude_columns:
+      - cost_price
+      - supplier_id
+
+  # Full refresh table (no incremental_key) — replaced on every run
+  - table: daily_store_metrics
+
+another_source_conn:
+  - table: events
+    incremental_key: created_at
+    primary_key: event_id

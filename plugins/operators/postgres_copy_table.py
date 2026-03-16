@@ -1,152 +1,352 @@
-from typing import List
+from __future__ import annotations
 
+import logging
+from pathlib import Path
+from typing import Iterator
+
+import dlt
 import duckdb
+import pyarrow as pa
+import yaml
 
+from airflow.exceptions import AirflowException
 from airflow.models.baseoperator import BaseOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (module-level so they are independently testable)
+# ---------------------------------------------------------------------------
+
+def _get_jsonb_columns(
+    source_conn_str: str,
+    source_schema: str,
+    table_name: str,
+    exclude_cols: list[str],
+) -> dict[str, dict]:
+    """Return dlt column hints for every JSONB column in the source table.
+
+    Queries ``information_schema.columns`` through DuckDB's postgres extension
+    and returns a dict of the form ``{column_name: {"data_type": "complex"}}``
+    that can be passed directly to ``dlt.resource(..., columns=...)``.
+
+    The ``complex`` dlt type maps to ``JSONB`` when the destination is PostgreSQL.
+    Columns present in *exclude_cols* are omitted.
+    """
+    con = duckdb.connect()
+    try:
+        con.sql("INSTALL postgres; LOAD postgres;")
+        con.sql(
+            f"ATTACH '{source_conn_str}' AS src (TYPE POSTGRES, READ_ONLY)"
+        )
+        rows = con.execute(
+            """
+            SELECT column_name
+            FROM src.information_schema.columns
+            WHERE table_schema = ?
+              AND table_name   = ?
+              AND udt_name     = 'jsonb'
+            """,
+            [source_schema, table_name],
+        ).fetchall()
+    finally:
+        con.close()
+
+    exclude_set = set(exclude_cols)
+    return {
+        row[0]: {"data_type": "complex"}
+        for row in rows
+        if row[0] not in exclude_set
+    }
+
+
+def _stream_table(
+    source_conn_str: str,
+    source_schema: str,
+    table_name: str,
+    exclude_cols: list[str],
+    batch_size: int,
+    incremental_key: str | None = None,
+    start_value: str | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Open an in-memory DuckDB connection, attach the source PostgreSQL database,
+    and stream the table in Arrow RecordBatch chunks.
+
+    Uses ``EXCLUDE(...)`` for column exclusion so DuckDB resolves the column
+    list server-side.  The optional *WHERE* clause pushes the incremental
+    filter down to PostgreSQL via the postgres extension, minimising data
+    transfer for large tables.
+
+    Memory is bounded regardless of table size because data is never fully
+    materialised — ``fetch_record_batch`` streams rows in chunks of
+    *batch_size* rows.
+    """
+    col_selector = (
+        f"* EXCLUDE ({', '.join(exclude_cols)})" if exclude_cols else "*"
+    )
+    where_clause = (
+        f"WHERE {incremental_key} >= '{start_value}'"
+        if incremental_key and start_value is not None
+        else ""
+    )
+
+    con = duckdb.connect()
+    try:
+        con.sql("INSTALL postgres; LOAD postgres;")
+        con.sql(
+            f"ATTACH '{source_conn_str}' AS src"
+            f" (TYPE POSTGRES, READ_ONLY, SCHEMA '{source_schema}')"
+        )
+
+        log.info(
+            "Streaming %s.%s [%s] batch_size=%d",
+            source_schema, table_name, where_clause or "full table", batch_size,
+        )
+
+        result = con.execute(
+            f"SELECT {col_selector} FROM src.{table_name} {where_clause}"
+        )
+        reader = result.fetch_record_batch(rows_per_batch=batch_size)
+
+        while True:
+            try:
+                yield reader.read_next_batch()
+            except StopIteration:
+                break
+    finally:
+        con.close()
+
+
+def _make_resource(
+    table_cfg: dict,
+    source_conn_str: str,
+    source_schema: str,
+    batch_size: int,
+    jsonb_hints: dict[str, dict],
+) -> dlt.sources.DltResource:
+    """Dynamically build a ``dlt.resource`` for a single table config entry.
+
+    Two modes:
+    * **Incremental** (``incremental_key`` present): uses dlt's delete+insert
+      merge strategy.  The cursor value is persisted atomically with data in
+      the destination DB so failed runs are safe to retry.
+    * **Full refresh** (no ``incremental_key``): ``write_disposition="replace"``
+      — the destination table is fully replaced on every run.
+
+    Uses ``dlt.resource()`` as a function call (rather than a decorator) so
+    that resources can be created inside a loop with per-table configuration.
+    Each generator captures its arguments via Python default-parameter binding
+    to avoid closure-over-loop-variable issues.
+    """
+    table_name = table_cfg["table"]
+    exclude_cols = table_cfg.get("exclude_columns", [])
+    incremental_key = table_cfg.get("incremental_key")
+    primary_key = table_cfg.get("primary_key", "id")
+
+    if incremental_key:
+        # Bind all table-specific values as default args to avoid late-binding.
+        def _gen(
+            cursor=dlt.sources.incremental(
+                incremental_key,
+                initial_value="1970-01-01T00:00:00Z",
+            ),
+            _conn=source_conn_str,
+            _schema=source_schema,
+            _table=table_name,
+            _excl=exclude_cols,
+            _bs=batch_size,
+            _ikey=incremental_key,
+        ):
+            yield from _stream_table(
+                _conn, _schema, _table, _excl, _bs,
+                incremental_key=_ikey,
+                start_value=cursor.start_value,
+            )
+
+        return dlt.resource(
+            _gen,
+            name=table_name,
+            primary_key=primary_key,
+            write_disposition={"disposition": "merge", "strategy": "delete-insert"},
+            columns=jsonb_hints or None,
+        )
+    else:
+        # Bind all table-specific values as default args to avoid late-binding.
+        def _gen(  # type: ignore[no-redef]
+            _conn=source_conn_str,
+            _schema=source_schema,
+            _table=table_name,
+            _excl=exclude_cols,
+            _bs=batch_size,
+        ):
+            yield from _stream_table(_conn, _schema, _table, _excl, _bs)
+
+        return dlt.resource(
+            _gen,
+            name=table_name,
+            write_disposition="replace",
+            columns=jsonb_hints or None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Airflow Operator
+# ---------------------------------------------------------------------------
 
 class PostgresCopyTable(BaseOperator):
+    """Copy tables from a source PostgreSQL database to a destination PostgreSQL
+    database using `dlt <https://dlthub.com/>`_ for incremental state management
+    and `DuckDB <https://duckdb.org/>`_ as the transformation and query engine.
+
+    Tables to copy are defined in a YAML configuration file rather than as
+    operator parameters — add new tables simply by editing the YAML, with no
+    code changes required.
+
+    **How it works**
+
+    For each table listed under *source_conn_id* in the YAML:
+
+    * DuckDB attaches the source PostgreSQL via the ``postgres`` extension and
+      streams data as Arrow RecordBatches (memory-bounded, suitable for tables
+      with hundreds of millions of rows).
+    * JSONB columns are auto-detected via ``information_schema`` and preserved
+      as ``JSONB`` in the destination.
+    * If the table has an ``incremental_key``, dlt uses a delete+insert merge
+      strategy: only rows where ``incremental_key >= last_cursor`` are fetched,
+      and matching rows in the destination are deleted then re-inserted.  The
+      cursor is stored atomically with the data in the destination — if a run
+      fails, the next run replays from the last successful cursor.
+    * Tables without an ``incremental_key`` are fully replaced on every run.
+
+    **YAML config format** (``config_path``)::
+
+        <airflow_connection_name>:
+          - table: <table_name>
+            incremental_key: <timestamp_column>   # optional
+            primary_key: <pk_column>              # optional, default 'id'
+            exclude_columns:                      # optional
+              - <column_name>
+
+    **Required packages**::
+
+        dlt[postgres]   duckdb   pyarrow   pyyaml
+        apache-airflow-providers-postgres
+
+    :param source_conn_id: Airflow connection ID for the source PostgreSQL database.
+        Must match a top-level key in the YAML config file.
+    :param target_conn_id: Airflow connection ID for the destination PostgreSQL database.
+    :param config_path: Absolute (or Airflow-relative) path to the YAML config file.
+    :param dataset_name: Destination schema name (dlt ``dataset_name``).  Defaults
+        to ``"public"``.
+    :param source_schema: Source PostgreSQL schema to read tables from.  Defaults
+        to ``"public"``.
+    :param batch_size: Number of rows per Arrow RecordBatch when streaming large
+        tables.  Defaults to ``50_000``.
+    :param pipeline_name: dlt pipeline name used for state storage.  Defaults to
+        ``"pg_copy_<source_conn_id>"``.  Override when running multiple pipelines
+        writing to the same destination schema to avoid state conflicts.
     """
-    The operator uses `DuckDB <https://duckdb.org/>`_ to connect directly to
-    both the source and target PostgreSQL databases.
 
-    It then copies the data in a single, efficient step using a
-    ``CREATE TABLE AS SELECT`` command. This method avoids loading the data
-    into the Airflow worker's memory, making the transfer significantly faster for large tables.
-
-    This operator requires the following Python packages:
-
-    * ``apache-airflow-providers-postgres``
-    * ``duckdb``
-
-    The operator will automatically attempt to install and load the ``postgres`` extension for DuckDB at runtime.
-
-    :param source_conn_id: The Airflow connection ID for the source PostgreSQL database.
-    :type source_conn_id: str
-    :param target_conn_id: The Airflow connection ID for the target PostgreSQL database.
-    :type target_conn_id: str
-    :param source_table: The name of the table to copy from the source database.
-    :type source_table: str
-    :param target_table: The name of the table to be created or replaced in the target database.
-    :type target_table: str
-    :param target_schema: The name of the schema to be used on the target connection.
-    :type target_schema: str
-    :param source_schema: The name of the schema to be used on the source connection.
-    :type source_schema: str
-    :param if_exists: Defines how to handle the target table if it already exists.
-        Can be 'replace' (drops and recreates the table) or 'truncate' (empties
-        the existing table and inserts new data). Defaults to 'replace'.
-    :type if_exists: str
-    :param exclude_columns: A list of column names to exclude from the copy operation.
-        These columns will not be transferred from the source table to the target table.
-        Defaults to an empty list, meaning all columns are copied.
-    :type exclude_columns: List[str]
-    """
-    template_fields = ('source_conn_id', 'target_conn_id', 'exclude_columns',
-                       'source_table', 'target_table', 'if_exists')
+    template_fields = ("source_conn_id", "target_conn_id", "config_path", "dataset_name")
 
     def __init__(
         self,
         source_conn_id: str,
         target_conn_id: str,
-        source_table: str,
-        target_table: str,
-        source_schema: str = 'public',
-        target_schema: str = 'public',
-        if_exists: str = 'replace',
-        exclude_columns: List[str] = [],
-        **kwargs
+        config_path: str,
+        dataset_name: str = "public",
+        source_schema: str = "public",
+        batch_size: int = 50_000,
+        pipeline_name: str | None = None,
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.source_conn_id = source_conn_id
         self.target_conn_id = target_conn_id
-        self.source_db_name = 'source'
-        self.target_db_name = 'target'
-        self.source_table = f'{self.source_db_name}.{source_table}'
-        self.target_table = f'{self.target_db_name}.{target_table}'
+        self.config_path = config_path
+        self.dataset_name = dataset_name
         self.source_schema = source_schema
-        self.target_schema = target_schema
-        self.if_exists = if_exists
-        self.exclude_columns = exclude_columns
+        self.batch_size = batch_size
+        self.pipeline_name = pipeline_name or f"pg_copy_{source_conn_id}"
 
-        self.source_hook = self.load_conn(source_conn_id)
-        self.target_hook = self.load_conn(target_conn_id)
+    # ------------------------------------------------------------------
 
-    def execute(self, context):
-        with duckdb.connect() as duckdb_conn:
-            duckdb_conn.execute('INSTALL postgres; LOAD postgres;')
-            source_query = self.build_source_query()
+    def execute(self, context) -> None:
+        # 1. Load YAML config and extract the table list for this source.
+        config = yaml.safe_load(Path(self.config_path).read_text())
+        tables: list[dict] = config.get(self.source_conn_id, [])
+        if not tables:
+            raise AirflowException(
+                f"No tables configured for connection '{self.source_conn_id}' "
+                f"in '{self.config_path}'."
+            )
 
-            self.attach_databases(duckdb_conn)
+        # 2. Resolve connection URIs from Airflow connections.
+        source_hook = PostgresHook(postgres_conn_id=self.source_conn_id)
+        target_hook = PostgresHook(postgres_conn_id=self.target_conn_id)
+        source_conn_str: str = source_hook.get_uri()
+        target_conn_str: str = target_hook.get_uri()
 
-            if self.if_exists == 'replace':
-                self.log.info(f"Starting copy from '{self.source_table}' to '{self.target_table}'")
+        # 3. Build dlt resources — one per table.
+        resources = []
+        for table_cfg in tables:
+            table_name = table_cfg.get("table")
+            if not table_name:
+                raise AirflowException(
+                    f"Each entry in '{self.source_conn_id}' must have a 'table' key."
+                )
 
-                duckdb_conn.execute(f"""
-                    CREATE OR REPLACE TABLE {self.target_table} AS
-                    {source_query}
-                """)
+            exclude_cols = table_cfg.get("exclude_columns", [])
 
-            if self.if_exists == 'truncate':
-                try:
-                    source_cols_desc = duckdb_conn.execute(f"DESCRIBE {self.source_table}").fetchall()
-                    target_cols_desc = duckdb_conn.execute(f"DESCRIBE {self.target_table}").fetchall()
+            self.log.info(
+                "Preparing resource for table '%s' (incremental_key=%s)",
+                table_name,
+                table_cfg.get("incremental_key", "none — full refresh"),
+            )
 
-                    source_columns = {col[0]: col[1] for col in source_cols_desc}
-                    target_columns = {col[0] for col in target_cols_desc}
+            jsonb_hints = _get_jsonb_columns(
+                source_conn_str, self.source_schema, table_name, exclude_cols
+            )
+            if jsonb_hints:
+                self.log.info(
+                    "Detected JSONB columns in '%s': %s", table_name, list(jsonb_hints)
+                )
 
-                    columns_to_add = {
-                        k: v for k, v in source_columns.items() if k not in target_columns
-                    }
+            resource = _make_resource(
+                table_cfg, source_conn_str, self.source_schema,
+                self.batch_size, jsonb_hints,
+            )
+            resources.append(resource)
 
-                    for col_name, col_type in columns_to_add.items():
-                        self.log.info(f"Adding column '{col_name}' with type '{col_type}' to table '{self.target_table}'")
-                        duckdb_conn.execute(f'ALTER TABLE {self.target_table} ADD COLUMN "{col_name}" {col_type}')
+        # 4. Wrap resources in a dlt source.
+        @dlt.source(name=self.source_conn_id)
+        def _source():
+            return resources
 
-                    self.log.info(f"Truncating table {self.target_table}")
+        # 5. Configure and run the dlt pipeline.
+        pipeline = dlt.pipeline(
+            pipeline_name=self.pipeline_name,
+            destination=dlt.destinations.postgres(credentials=target_conn_str),
+            dataset_name=self.dataset_name,
+        )
 
-                    duckdb_conn.execute(f'TRUNCATE {self.target_table}')
-                except duckdb.CatalogException as err:
-                    self.log.warn(err)
+        self.log.info(
+            "Running dlt pipeline '%s' → schema '%s' on '%s'",
+            self.pipeline_name, self.dataset_name, self.target_conn_id,
+        )
 
-                    self.log.info(f'Creating table {self.target_table}')
-                    duckdb_conn.execute(f"""
-                        CREATE TABLE {self.target_table} AS
-                        {source_query}
-                        WITH NO DATA
-                    """)
+        # loader_file_format="csv" uses PostgreSQL's COPY command for bulk inserts,
+        # which is significantly faster than INSERT VALUES for large datasets.
+        load_info = pipeline.run(_source(), loader_file_format="csv")
 
-                self.log.info(f"Inserting values from {self.source_table} to {self.target_table}")
-                duckdb_conn.execute(f"""
-                    INSERT INTO {self.target_table} BY NAME (
-                        {source_query}
-                    )
-                """)
+        self.log.info("Load complete:\n%s", load_info)
 
-    def build_source_query(self) -> str:
-        if self.exclude_columns:
-            columns = ','.join(self.exclude_columns)
-            return f'SELECT * EXCLUDE({columns}) FROM {self.source_table}'
-
-        return f'SELECT * FROM {self.source_table}'
-
-    def attach_databases(self, conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
-        conn.execute(f"""
-            ATTACH '{self.source_hook.get_uri()}' AS
-            {self.source_db_name} (TYPE postgres, SCHEMA '{self.source_schema}')
-        """)
-        conn.execute(f"""
-            ATTACH '{self.target_hook.get_uri()}' AS
-            {self.target_db_name} (TYPE postgres, SCHEMA '{self.target_schema}')
-        """)
-
-        return conn
-
-
-    def load_conn(self, conn_id) -> PostgresHook:
-        hook = PostgresHook(postgres_conn_id=conn_id)
-
-        self.log.info(f'Loaded connection: {conn_id}')
-
-        return hook
+        # Surface any load errors as task failures.
+        if load_info.has_failed_jobs:
+            failed = [str(j) for p in load_info.load_packages for j in p.jobs.get("failed_jobs", [])]
+            raise AirflowException(
+                f"dlt pipeline '{self.pipeline_name}' had failed jobs:\n"
+                + "\n".join(failed)
+            )
