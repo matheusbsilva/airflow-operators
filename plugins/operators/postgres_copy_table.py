@@ -35,8 +35,7 @@ def _get_jsonb_columns(
     The ``complex`` dlt type maps to ``JSONB`` when the destination is PostgreSQL.
     Columns present in *exclude_cols* are omitted.
     """
-    con = duckdb.connect()
-    try:
+    with duckdb.connect() as con:
         con.sql("INSTALL postgres; LOAD postgres;")
         con.sql(
             f"ATTACH '{source_conn_str}' AS src (TYPE POSTGRES, READ_ONLY)"
@@ -51,8 +50,6 @@ def _get_jsonb_columns(
             """,
             [source_schema, table_name],
         ).fetchall()
-    finally:
-        con.close()
 
     return {
         row[0]: {"data_type": "complex"}
