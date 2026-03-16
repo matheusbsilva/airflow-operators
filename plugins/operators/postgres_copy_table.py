@@ -18,10 +18,6 @@ from airflow.utils.task_group import TaskGroup
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Helpers (module-level so they are independently testable)
-# ---------------------------------------------------------------------------
-
 def _get_jsonb_columns(
     source_conn_str: str,
     source_schema: str,
@@ -132,7 +128,6 @@ def _make_resource(
     * **Full refresh** (no ``incremental_key``): ``write_disposition="replace"``
       — the destination table is fully replaced on every run.
     """
-    # Bind all table-specific values as default args to avoid late-binding.
     gen_defaults: dict = dict(
         _conn=source_conn_str,
         _schema=source_schema,
@@ -145,8 +140,6 @@ def _make_resource(
         gen_defaults["cursor"] = dlt.sources.incremental(
             incremental_key,
             initial_value="1970-01-01T00:00:00Z",
-            # Defer the load window to Airflow's data_interval_start/end.
-            # dlt reads these automatically from the Airflow task context.
             allow_external_schedulers=True,
         )
 
@@ -178,10 +171,6 @@ def _make_resource(
 
     return dlt.resource(_gen, **resource_kwargs)
 
-
-# ---------------------------------------------------------------------------
-# Airflow Operator  (single-table)
-# ---------------------------------------------------------------------------
 
 class PostgresCopyTable(BaseOperator):
     """Copy a single table from a source PostgreSQL database to a destination
@@ -262,16 +251,12 @@ class PostgresCopyTable(BaseOperator):
         self.pipeline_name = pipeline_name or f"pg_copy_{source_conn_id}_{table_name}"
         self.full_refresh = full_refresh
 
-    # ------------------------------------------------------------------
-
     def execute(self, context) -> None:
-        # 1. Resolve connection URIs from Airflow connections.
         source_hook = PostgresHook(postgres_conn_id=self.source_conn_id)
         target_hook = PostgresHook(postgres_conn_id=self.target_conn_id)
         source_conn_str: str = source_hook.get_uri()
         target_conn_str: str = target_hook.get_uri()
 
-        # 2. Auto-detect JSONB columns in the source.
         jsonb_hints = _get_jsonb_columns(
             source_conn_str, self.source_schema, self.table_name, self.exclude_columns
         )
@@ -280,7 +265,6 @@ class PostgresCopyTable(BaseOperator):
                 "Detected JSONB columns in '%s': %s", self.table_name, list(jsonb_hints)
             )
 
-        # 3. Build the dlt resource for this table.
         self.log.info(
             "Preparing resource for table '%s' (incremental_key=%s, full_refresh=%s)",
             self.table_name,
@@ -299,14 +283,12 @@ class PostgresCopyTable(BaseOperator):
             jsonb_hints=jsonb_hints,
         )
 
-        # 4. Wrap resource in a dlt source.
         source_conn_id = self.source_conn_id
 
         @dlt.source(name=source_conn_id)
         def _source():
             return resource
 
-        # 5. Configure and run the dlt pipeline.
         pipeline = dlt.pipeline(
             pipeline_name=self.pipeline_name,
             destination=dlt.destinations.postgres(credentials=target_conn_str),
@@ -322,13 +304,10 @@ class PostgresCopyTable(BaseOperator):
         if self.full_refresh:
             run_kwargs["write_disposition"] = "replace"
 
-        # loader_file_format="csv" uses PostgreSQL's COPY command for bulk inserts,
-        # which is significantly faster than INSERT VALUES for large datasets.
         load_info = pipeline.run(_source(), **run_kwargs)
 
         self.log.info("Load complete:\n%s", load_info)
 
-        # Surface any load errors as task failures.
         if load_info.has_failed_jobs:
             failed = [str(j) for p in load_info.load_packages for j in p.jobs.get("failed_jobs", [])]
             raise AirflowException(
@@ -336,10 +315,6 @@ class PostgresCopyTable(BaseOperator):
                 + "\n".join(failed)
             )
 
-
-# ---------------------------------------------------------------------------
-# DAG-level factory  (creates a TaskGroup with one task per table)
-# ---------------------------------------------------------------------------
 
 def create_postgres_copy_task_group(
     group_id: str,
