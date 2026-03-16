@@ -1,499 +1,676 @@
-"""Tests for plugins/operators/postgres_copy_table.py
+"""Integration tests for PostgresCopyTable operator.
 
-Covers three key behaviours:
-1. Correct schema loading — JSONB columns are detected and mapped to the
-   ``complex`` dlt type; excluded columns are omitted.
-2. Incremental loading — the correct WHERE clause is built from the
-   incremental cursor; the dlt resource uses the delete-insert merge strategy.
-3. Full-refresh on demand — ``full_refresh=True`` forces
-   ``write_disposition="replace"`` on the pipeline run regardless of whether
-   an ``incremental_key`` is set.
+Each test class spins up two isolated PostgreSQL instances (via Docker /
+testcontainers when available, local Postgres otherwise — see conftest.py)
+and exercises the operator end-to-end against real databases.
+
+The three behaviours under test
+--------------------------------
+1. **Correct schema loading** — column types (including JSONB) survive the
+   round-trip; excluded columns are absent from the target.
+2. **Incremental loading** — subsequent runs only process rows whose
+   ``incremental_key`` value is newer than the last run's high-water mark;
+   updated rows are replaced rather than duplicated.
+3. **Full refresh on demand** — ``full_refresh=True`` replaces the entire
+   target table, including rows that were deleted from the source.
+
+Requirements (install once)
+---------------------------
+    pip install testcontainers[postgres] psycopg2-binary pytest dlt[postgres] duckdb pyarrow
+    # For Docker path: docker pull postgres:15
 """
 from __future__ import annotations
 
+import uuid
 from unittest.mock import MagicMock, patch
 
+import psycopg2
 import pytest
+from psycopg2.extras import Json
 
-from airflow.exceptions import AirflowException
-
-from plugins.operators.postgres_copy_table import (
-    PostgresCopyTable,
-    _get_jsonb_columns,
-    _make_resource,
-    _stream_table,
-)
+from plugins.operators.postgres_copy_table import PostgresCopyTable
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _mock_duckdb_con(*, fetchall=None, batches=None):
-    """Return a MagicMock that behaves like a ``duckdb.Connection`` used as a
-    context manager (``with duckdb.connect() as con:``).
-
-    ``__enter__`` returns the connection itself, matching DuckDB's real API.
-    """
-    con = MagicMock()
-    con.__enter__ = MagicMock(return_value=con)
-    con.__exit__ = MagicMock(return_value=False)
-    if fetchall is not None:
-        con.execute.return_value.fetchall.return_value = fetchall
-    if batches is not None:
-        con.execute.return_value.fetch_record_batch.return_value = iter(batches)
-    return con
+def _pg_uri(pg) -> str:
+    """Return a plain ``postgresql://`` URI from any fixture that exposes
+    ``get_connection_url()`` (works for both ``PostgresContainer`` and the
+    local ``_LocalPg`` wrapper defined in conftest.py)."""
+    return pg.get_connection_url().replace("+psycopg2", "")
 
 
-def _make_operator(**overrides):
-    defaults = dict(
-        task_id="test_task",
-        source_conn_id="src_conn",
-        target_conn_id="tgt_conn",
-        table_name="my_table",
-    )
-    defaults.update(overrides)
-    return PostgresCopyTable(**defaults)
+def _connect(pg) -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(_pg_uri(pg))
+    conn.autocommit = True
+    return conn
 
 
-def _setup_dlt_mocks(mock_dlt, mock_hook_cls, *, failed_jobs=False):
-    """Wire up the dlt and PostgresHook mocks shared by execute() tests.
-
-    Returns the ``mock_pipeline`` so callers can assert on ``run.call_args``.
-    """
-    mock_hook_cls.return_value.get_uri.side_effect = [
-        "postgres://src",
-        "postgres://tgt",
-    ]
-
-    mock_load_info = MagicMock()
-    mock_load_info.has_failed_jobs = failed_jobs
-    if failed_jobs:
-        failed_job = MagicMock()
-        mock_load_info.load_packages = [
-            MagicMock(jobs={"failed_jobs": [failed_job]})
-        ]
-    else:
-        mock_load_info.load_packages = []
-
-    mock_pipeline = MagicMock()
-    mock_pipeline.run.return_value = mock_load_info
-    mock_dlt.pipeline.return_value = mock_pipeline
-    # dlt.source(name=...) returns a decorator; make it a transparent pass-through
-    mock_dlt.source.return_value = lambda fn: fn
-
-    return mock_pipeline
+def _uid() -> str:
+    """Short, unique identifier used to name schemas so tests don't collide."""
+    return uuid.uuid4().hex[:10]
 
 
-# ── _get_jsonb_columns ────────────────────────────────────────────────────────
+def _run_operator(source_pg, target_pg, **op_kwargs) -> None:
+    """Instantiate and execute a ``PostgresCopyTable`` operator, injecting the
+    real Postgres URIs by patching ``PostgresHook.get_uri()``."""
+    op_kwargs.setdefault("task_id", "test_copy")
+    op_kwargs.setdefault("source_conn_id", "src")
+    op_kwargs.setdefault("target_conn_id", "tgt")
+    # Use a unique pipeline name by default so dlt state doesn't bleed between
+    # tests.  Tests that need two runs to share state pass an explicit name.
+    op_kwargs.setdefault("pipeline_name", f"test_{uuid.uuid4().hex[:12]}")
+
+    op = PostgresCopyTable(**op_kwargs)
+
+    src_uri = _pg_uri(source_pg)
+    tgt_uri = _pg_uri(target_pg)
+
+    with patch("plugins.operators.postgres_copy_table.PostgresHook") as mock_hook_cls:
+        hook = MagicMock()
+        hook.get_uri.side_effect = [src_uri, tgt_uri]
+        mock_hook_cls.return_value = hook
+        op.execute({})
 
 
-class TestGetJsonbColumns:
-    """Unit tests for the JSONB-column discovery helper."""
-
-    def test_returns_complex_hint_for_each_jsonb_column(self):
-        con = _mock_duckdb_con(fetchall=[("meta",), ("cfg",)])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            result = _get_jsonb_columns("conn", "public", "tbl", [])
-
-        assert result == {
-            "meta": {"data_type": "complex"},
-            "cfg": {"data_type": "complex"},
-        }
-
-    def test_excludes_columns_listed_in_exclude_cols(self):
-        con = _mock_duckdb_con(fetchall=[("meta",), ("cfg",)])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            result = _get_jsonb_columns("conn", "public", "tbl", ["meta"])
-
-        assert result == {"cfg": {"data_type": "complex"}}
-        assert "meta" not in result
-
-    def test_returns_empty_dict_when_no_jsonb_columns(self):
-        con = _mock_duckdb_con(fetchall=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            result = _get_jsonb_columns("conn", "public", "tbl", [])
-
-        assert result == {}
-
-    def test_passes_correct_schema_and_table_as_bind_params(self):
-        con = _mock_duckdb_con(fetchall=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            _get_jsonb_columns("conn", "my_schema", "my_table", [])
-
-        # Second positional argument to con.execute() is the list of bind params
-        bind_params = con.execute.call_args[0][1]
-        assert bind_params == ["my_schema", "my_table"]
+# ── 1. Correct schema loading ─────────────────────────────────────────────────
 
 
-# ── _stream_table ─────────────────────────────────────────────────────────────
+class TestSchemaLoading:
+    """Verify that tables are copied with the correct column types, including
+    JSONB, and that excluded columns are absent from the target."""
 
-
-class TestStreamTable:
-    """Unit tests for WHERE-clause generation and column exclusion in the
-    streaming helper.  DuckDB I/O is mocked; we inspect the SQL handed to
-    ``con.execute``."""
-
-    def _sql(self, con):
-        """Extract the SQL string from the most recent con.execute() call."""
-        return con.execute.call_args[0][0]
-
-    def test_full_table_produces_no_where_clause(self):
-        con = _mock_duckdb_con(batches=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            list(_stream_table("conn", "public", "tbl", [], 1_000))
-
-        assert "WHERE" not in self._sql(con)
-
-    def test_incremental_where_clause_includes_start_and_end(self):
-        con = _mock_duckdb_con(batches=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            list(
-                _stream_table(
-                    "conn",
-                    "public",
-                    "tbl",
-                    [],
-                    1_000,
-                    incremental_key="updated_at",
-                    start_value="2024-01-01T00:00:00Z",
-                    end_value="2024-02-01T00:00:00Z",
+    def test_basic_columns_are_copied_with_correct_values(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.users (
+                    id   SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    age  INT
                 )
+                """
+            )
+            cur.execute(
+                f"INSERT INTO {schema}.users (name, age) VALUES (%s, %s), (%s, %s)",
+                ("Alice", 30, "Bob", 25),
             )
 
-        sql = self._sql(con)
-        assert "WHERE" in sql
-        assert "updated_at >= '2024-01-01T00:00:00Z'" in sql
-        assert "updated_at < '2024-02-01T00:00:00Z'" in sql
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="users",
+            source_schema=schema,
+            dataset_name=schema,
+            full_refresh=True,
+        )
 
-    def test_incremental_with_only_start_value_omits_upper_bound(self):
-        con = _mock_duckdb_con(batches=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            list(
-                _stream_table(
-                    "conn",
-                    "public",
-                    "tbl",
-                    [],
-                    1_000,
-                    incremental_key="updated_at",
-                    start_value="2024-01-01T00:00:00Z",
-                    end_value=None,
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT name, age FROM {schema}.users ORDER BY name")
+            rows = cur.fetchall()
+
+        assert rows == [("Alice", 30), ("Bob", 25)]
+
+    def test_jsonb_column_type_is_preserved_in_target(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.events (
+                    id      SERIAL PRIMARY KEY,
+                    payload JSONB
                 )
+                """
+            )
+            cur.execute(
+                f"INSERT INTO {schema}.events (payload) VALUES (%s), (%s)",
+                (
+                    Json({"type": "click", "x": 100}),
+                    Json({"type": "view", "page": "/home"}),
+                ),
             )
 
-        sql = self._sql(con)
-        assert "updated_at >= '2024-01-01T00:00:00Z'" in sql
-        assert " < " not in sql
-
-    def test_excluded_columns_use_duckdb_exclude_syntax(self):
-        con = _mock_duckdb_con(batches=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            list(_stream_table("conn", "public", "tbl", ["secret", "pii"], 1_000))
-
-        assert "EXCLUDE (secret, pii)" in self._sql(con)
-
-    def test_no_excluded_columns_selects_star(self):
-        con = _mock_duckdb_con(batches=[])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            list(_stream_table("conn", "public", "tbl", [], 1_000))
-
-        sql = self._sql(con)
-        assert "SELECT *" in sql
-        assert "EXCLUDE" not in sql
-
-    def test_yields_all_record_batches_from_result(self):
-        batch_a, batch_b = MagicMock(), MagicMock()
-        con = _mock_duckdb_con(batches=[batch_a, batch_b])
-        with patch(
-            "plugins.operators.postgres_copy_table.duckdb.connect", return_value=con
-        ):
-            result = list(_stream_table("conn", "public", "tbl", [], 1_000))
-
-        assert result == [batch_a, batch_b]
-
-
-# ── _make_resource ────────────────────────────────────────────────────────────
-
-
-class TestMakeResource:
-    """Unit tests for the dlt resource factory.
-
-    ``dlt`` is fully mocked so we only verify that the correct keyword
-    arguments are forwarded to ``dlt.resource``.
-    """
-
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_incremental_key_sets_delete_insert_merge_disposition(self, mock_dlt):
-        mock_dlt.sources.incremental.return_value = MagicMock(
-            start_value=None, end_value=None
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="events",
+            source_schema=schema,
+            dataset_name=schema,
+            full_refresh=True,
         )
 
-        _make_resource(
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT udt_name
+                FROM   information_schema.columns
+                WHERE  table_schema = %s
+                  AND  table_name   = 'events'
+                  AND  column_name  = 'payload'
+                """,
+                (schema,),
+            )
+            row = cur.fetchone()
+
+        assert row is not None, "payload column missing from target"
+        assert row[0] == "jsonb", f"expected jsonb, got {row[0]}"
+
+    def test_jsonb_data_values_round_trip_correctly(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        payload = {"key": "value", "nested": {"n": 42}}
+
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(f"CREATE TABLE {schema}.docs (id INT, data JSONB)")
+            cur.execute(
+                f"INSERT INTO {schema}.docs VALUES (%s, %s)",
+                (1, Json(payload)),
+            )
+
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="docs",
+            source_schema=schema,
+            dataset_name=schema,
+            full_refresh=True,
+        )
+
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT data FROM {schema}.docs WHERE id = 1")
+            row = cur.fetchone()
+
+        assert row is not None
+        assert row[0] == payload
+
+    def test_excluded_columns_are_absent_from_target(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.products (
+                    id            SERIAL PRIMARY KEY,
+                    name          TEXT,
+                    internal_code TEXT
+                )
+                """
+            )
+            cur.execute(
+                f"INSERT INTO {schema}.products (name, internal_code) VALUES (%s, %s)",
+                ("Widget", "SECRET"),
+            )
+
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="products",
+            source_schema=schema,
+            dataset_name=schema,
+            exclude_columns=["internal_code"],
+            full_refresh=True,
+        )
+
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM   information_schema.columns
+                WHERE  table_schema = %s AND table_name = 'products'
+                """,
+                (schema,),
+            )
+            columns = {row[0] for row in cur.fetchall()}
+
+        assert "internal_code" not in columns
+        assert "name" in columns
+
+    def test_multiple_jsonb_columns_all_have_correct_type(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.mixed (
+                    id       SERIAL PRIMARY KEY,
+                    metadata JSONB,
+                    settings JSONB,
+                    label    TEXT
+                )
+                """
+            )
+            cur.execute(
+                f"INSERT INTO {schema}.mixed (metadata, settings, label)"
+                f" VALUES (%s, %s, %s)",
+                (Json({"a": 1}), Json({"b": 2}), "hello"),
+            )
+
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="mixed",
+            source_schema=schema,
+            dataset_name=schema,
+            full_refresh=True,
+        )
+
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name, udt_name
+                FROM   information_schema.columns
+                WHERE  table_schema = %s AND table_name = 'mixed'
+                  AND  column_name IN ('metadata', 'settings')
+                ORDER  BY column_name
+                """,
+                (schema,),
+            )
+            rows = cur.fetchall()
+
+        assert len(rows) == 2
+        assert all(udt == "jsonb" for _, udt in rows), (
+            f"Expected both columns to be jsonb; got {rows}"
+        )
+
+
+# ── 2. Incremental loading ────────────────────────────────────────────────────
+
+
+class TestIncrementalLoading:
+    """Verify that the operator correctly identifies and loads only new or
+    changed rows on subsequent runs, using dlt's cursor state."""
+
+    def test_first_run_loads_all_existing_rows(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.orders (
+                    id         INT PRIMARY KEY,
+                    item       TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.orders VALUES
+                    (1, 'Apple',  '2024-01-01 00:00:00+00'),
+                    (2, 'Banana', '2024-01-02 00:00:00+00'),
+                    (3, 'Cherry', '2024-01-03 00:00:00+00')
+                """
+            )
+
+        _run_operator(
+            source_pg,
+            target_pg,
             table_name="orders",
-            exclude_cols=[],
+            source_schema=schema,
+            dataset_name=schema,
             incremental_key="updated_at",
             primary_key="id",
-            source_conn_str="postgres://src",
-            source_schema="public",
-            batch_size=1_000,
-            jsonb_hints={},
         )
 
-        _, kwargs = mock_dlt.resource.call_args
-        assert kwargs["write_disposition"] == {
-            "disposition": "merge",
-            "strategy": "delete-insert",
-        }
-        assert kwargs["primary_key"] == "id"
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {schema}.orders")
+            count = cur.fetchone()[0]
 
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_no_incremental_key_sets_replace_disposition(self, mock_dlt):
-        _make_resource(
+        assert count == 3
+
+    def test_second_run_appends_only_new_rows(
+        self, source_pg, target_pg
+    ):
+        schema = f"s_{_uid()}"
+        pipeline_name = f"incr_{_uid()}"
+
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.orders (
+                    id         INT PRIMARY KEY,
+                    item       TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.orders VALUES
+                    (1, 'Apple',  '2024-01-10 00:00:00+00'),
+                    (2, 'Banana', '2024-01-11 00:00:00+00')
+                """
+            )
+
+        common = dict(
             table_name="orders",
-            exclude_cols=[],
-            incremental_key=None,
-            primary_key="id",
-            source_conn_str="postgres://src",
-            source_schema="public",
-            batch_size=1_000,
-            jsonb_hints={},
-        )
-
-        _, kwargs = mock_dlt.resource.call_args
-        assert kwargs["write_disposition"] == "replace"
-        assert "primary_key" not in kwargs
-
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_jsonb_hints_are_passed_as_columns(self, mock_dlt):
-        hints = {"payload": {"data_type": "complex"}}
-
-        _make_resource(
-            table_name="events",
-            exclude_cols=[],
-            incremental_key=None,
-            primary_key="id",
-            source_conn_str="postgres://src",
-            source_schema="public",
-            batch_size=1_000,
-            jsonb_hints=hints,
-        )
-
-        _, kwargs = mock_dlt.resource.call_args
-        assert kwargs["columns"] == hints
-
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_empty_jsonb_hints_passes_none_as_columns(self, mock_dlt):
-        _make_resource(
-            table_name="events",
-            exclude_cols=[],
-            incremental_key=None,
-            primary_key="id",
-            source_conn_str="postgres://src",
-            source_schema="public",
-            batch_size=1_000,
-            jsonb_hints={},
-        )
-
-        _, kwargs = mock_dlt.resource.call_args
-        assert kwargs["columns"] is None
-
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_incremental_resource_uses_allow_external_schedulers(self, mock_dlt):
-        """Airflow's data_interval_start/end must control the load window."""
-        mock_dlt.sources.incremental.return_value = MagicMock(
-            start_value=None, end_value=None
-        )
-
-        _make_resource(
-            table_name="orders",
-            exclude_cols=[],
+            source_schema=schema,
+            dataset_name=schema,
             incremental_key="updated_at",
             primary_key="id",
-            source_conn_str="postgres://src",
-            source_schema="public",
-            batch_size=1_000,
-            jsonb_hints={},
+            pipeline_name=pipeline_name,
         )
 
-        mock_dlt.sources.incremental.assert_called_once_with(
-            "updated_at",
-            initial_value="1970-01-01T00:00:00Z",
-            allow_external_schedulers=True,
+        # Run 1: bootstrap — load both existing rows.
+        _run_operator(source_pg, target_pg, **common)
+
+        # Add a row whose timestamp is strictly newer than the cursor.
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.orders VALUES
+                    (3, 'Cherry', '2024-06-01 00:00:00+00')
+                """
+            )
+
+        # Run 2: incremental — should pick up only the new row.
+        _run_operator(source_pg, target_pg, **common)
+
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, item FROM {schema}.orders ORDER BY id"
+            )
+            rows = cur.fetchall()
+
+        assert rows == [(1, "Apple"), (2, "Banana"), (3, "Cherry")]
+
+    def test_old_rows_not_in_new_window_are_not_reloaded(
+        self, source_pg, target_pg
+    ):
+        """Rows already past the cursor high-water mark must not cause the
+        row count in the target to grow beyond what is in the source."""
+        schema = f"s_{_uid()}"
+        pipeline_name = f"incr_{_uid()}"
+
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.logs (
+                    id         INT PRIMARY KEY,
+                    msg        TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.logs VALUES
+                    (1, 'first',  '2024-01-01 00:00:00+00'),
+                    (2, 'second', '2024-01-02 00:00:00+00')
+                """
+            )
+
+        common = dict(
+            table_name="logs",
+            source_schema=schema,
+            dataset_name=schema,
+            incremental_key="updated_at",
+            primary_key="id",
+            pipeline_name=pipeline_name,
         )
 
+        _run_operator(source_pg, target_pg, **common)  # Run 1
 
-# ── PostgresCopyTable.execute ─────────────────────────────────────────────────
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {schema}.logs VALUES (3, 'third', '2024-03-01 00:00:00+00')"
+            )
 
+        _run_operator(source_pg, target_pg, **common)  # Run 2
 
-class TestPostgresCopyTableExecute:
-    """End-to-end tests for the operator's execute() method.
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {schema}.logs")
+            count = cur.fetchone()[0]
 
-    All external I/O (Postgres connections, DuckDB, dlt pipeline) is mocked.
-    """
+        # Exactly 3 rows — no phantom duplicates from rows below the cursor.
+        assert count == 3
 
-    # ── 1. Correct schema loading ────────────────────────────────────────────
-
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_jsonb_hints_forwarded_to_make_resource(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
+    def test_updated_rows_are_merged_not_duplicated(
+        self, source_pg, target_pg
     ):
-        hints = {"payload": {"data_type": "complex"}}
-        mock_get_jsonb.return_value = hints
-        _setup_dlt_mocks(mock_dlt, mock_hook_cls)
+        """When a source row is updated (newer ``updated_at``), the target must
+        reflect the change without duplicating the row (delete-insert merge)."""
+        schema = f"s_{_uid()}"
+        pipeline_name = f"incr_{_uid()}"
 
-        _make_operator().execute({})
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.records (
+                    id         INT PRIMARY KEY,
+                    status     TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.records VALUES
+                    (1, 'pending', '2024-01-01 00:00:00+00'),
+                    (2, 'pending', '2024-01-02 00:00:00+00')
+                """
+            )
 
-        mock_make_resource.assert_called_once()
-        _, kwargs = mock_make_resource.call_args
-        assert kwargs["jsonb_hints"] == hints
-
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_get_jsonb_columns_called_with_correct_args(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
-    ):
-        mock_get_jsonb.return_value = {}
-        _setup_dlt_mocks(mock_dlt, mock_hook_cls)
-
-        _make_operator(
-            table_name="orders",
-            source_schema="analytics",
-            exclude_columns=["secret"],
-        ).execute({})
-
-        mock_get_jsonb.assert_called_once_with(
-            "postgres://src", "analytics", "orders", ["secret"]
+        common = dict(
+            table_name="records",
+            source_schema=schema,
+            dataset_name=schema,
+            incremental_key="updated_at",
+            primary_key="id",
+            pipeline_name=pipeline_name,
         )
 
-    # ── 2. Incremental loading ───────────────────────────────────────────────
+        _run_operator(source_pg, target_pg, **common)  # Run 1: load both rows
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_incremental_run_does_not_add_write_disposition_to_run_kwargs(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
+        # Update row 1 with a new timestamp so it falls in the next window.
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {schema}.records
+                SET    status = 'done', updated_at = '2024-06-01 00:00:00+00'
+                WHERE  id = 1
+                """
+            )
+
+        _run_operator(source_pg, target_pg, **common)  # Run 2: picks up row 1
+
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, status FROM {schema}.records ORDER BY id"
+            )
+            rows = cur.fetchall()
+
+        # Row 1 updated, row 2 unchanged, no duplicates.
+        assert rows == [(1, "done"), (2, "pending")]
+
+
+# ── 3. Full refresh on demand ─────────────────────────────────────────────────
+
+
+class TestFullRefresh:
+    """Verify that ``full_refresh=True`` causes the target table to be fully
+    replaced by the current source contents."""
+
+    def test_full_refresh_loads_all_source_rows(
+        self, source_pg, target_pg
     ):
-        mock_get_jsonb.return_value = {}
-        mock_pipeline = _setup_dlt_mocks(mock_dlt, mock_hook_cls)
+        schema = f"s_{_uid()}"
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(f"CREATE TABLE {schema}.items (id INT, name TEXT)")
+            cur.execute(
+                f"INSERT INTO {schema}.items VALUES (1, 'A'), (2, 'B'), (3, 'C')"
+            )
 
-        _make_operator(incremental_key="updated_at").execute({})
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="items",
+            source_schema=schema,
+            dataset_name=schema,
+            full_refresh=True,
+        )
 
-        run_kwargs = mock_pipeline.run.call_args[1]
-        assert "write_disposition" not in run_kwargs
-        assert run_kwargs["loader_file_format"] == "csv"
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT id, name FROM {schema}.items ORDER BY id")
+            rows = cur.fetchall()
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_incremental_key_forwarded_to_make_resource(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
+        assert rows == [(1, "A"), (2, "B"), (3, "C")]
+
+    def test_full_refresh_removes_rows_deleted_from_source(
+        self, source_pg, target_pg
     ):
-        mock_get_jsonb.return_value = {}
-        _setup_dlt_mocks(mock_dlt, mock_hook_cls)
+        schema = f"s_{_uid()}"
+        pipeline_name = f"full_{_uid()}"
 
-        _make_operator(incremental_key="updated_at", primary_key="order_id").execute({})
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(f"CREATE TABLE {schema}.items (id INT, name TEXT)")
+            cur.execute(
+                f"INSERT INTO {schema}.items VALUES (1, 'A'), (2, 'B'), (3, 'C')"
+            )
 
-        _, kwargs = mock_make_resource.call_args
-        assert kwargs["incremental_key"] == "updated_at"
-        assert kwargs["primary_key"] == "order_id"
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="items",
+            source_schema=schema,
+            dataset_name=schema,
+            pipeline_name=pipeline_name,
+            full_refresh=True,
+        )
 
-    # ── 3. Full refresh ──────────────────────────────────────────────────────
+        # Delete rows 1 and 2 from the source.
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {schema}.items WHERE id IN (1, 2)")
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_full_refresh_adds_replace_write_disposition(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
-    ):
-        mock_get_jsonb.return_value = {}
-        mock_pipeline = _setup_dlt_mocks(mock_dlt, mock_hook_cls)
+        # Full refresh must mirror the source exactly — target should have only row 3.
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="items",
+            source_schema=schema,
+            dataset_name=schema,
+            pipeline_name=pipeline_name,
+            full_refresh=True,
+        )
 
-        _make_operator(full_refresh=True).execute({})
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT id, name FROM {schema}.items ORDER BY id")
+            rows = cur.fetchall()
 
-        run_kwargs = mock_pipeline.run.call_args[1]
-        assert run_kwargs["write_disposition"] == "replace"
+        assert rows == [(3, "C")]
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
     def test_full_refresh_overrides_incremental_key(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
+        self, source_pg, target_pg
     ):
-        """full_refresh=True must force replace even when incremental_key is set."""
-        mock_get_jsonb.return_value = {}
-        mock_pipeline = _setup_dlt_mocks(mock_dlt, mock_hook_cls)
+        """``full_refresh=True`` must replace the table even when an
+        ``incremental_key`` is configured, so that deleted rows are removed."""
+        schema = f"s_{_uid()}"
+        pipeline_name = f"full_{_uid()}"
 
-        _make_operator(incremental_key="updated_at", full_refresh=True).execute({})
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.logs (
+                    id         INT PRIMARY KEY,
+                    msg        TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.logs VALUES
+                    (1, 'first',  '2024-01-01 00:00:00+00'),
+                    (2, 'second', '2024-01-02 00:00:00+00'),
+                    (3, 'third',  '2024-01-03 00:00:00+00')
+                """
+            )
 
-        run_kwargs = mock_pipeline.run.call_args[1]
-        assert run_kwargs["write_disposition"] == "replace"
+        common = dict(
+            table_name="logs",
+            source_schema=schema,
+            dataset_name=schema,
+            incremental_key="updated_at",
+            primary_key="id",
+            pipeline_name=pipeline_name,
+        )
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_no_full_refresh_does_not_set_replace(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
+        # First run: incremental load populates the target.
+        _run_operator(source_pg, target_pg, **common)
+
+        # Delete rows 1 and 2 from the source.
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {schema}.logs WHERE id IN (1, 2)")
+
+        # Full refresh should see only row 3 despite incremental_key being set.
+        _run_operator(source_pg, target_pg, **common, full_refresh=True)
+
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT id FROM {schema}.logs ORDER BY id")
+            rows = cur.fetchall()
+
+        assert rows == [(3,)]
+
+    def test_full_refresh_second_run_contains_new_source_rows(
+        self, source_pg, target_pg
     ):
-        mock_get_jsonb.return_value = {}
-        mock_pipeline = _setup_dlt_mocks(mock_dlt, mock_hook_cls)
+        """Rows added to the source between runs must appear in the target
+        after a full refresh — not just the rows from the first run."""
+        schema = f"s_{_uid()}"
+        pipeline_name = f"full_{_uid()}"
 
-        _make_operator(full_refresh=False).execute({})
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(f"CREATE TABLE {schema}.items (id INT, name TEXT)")
+            cur.execute(f"INSERT INTO {schema}.items VALUES (1, 'A')")
 
-        run_kwargs = mock_pipeline.run.call_args[1]
-        assert "write_disposition" not in run_kwargs
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="items",
+            source_schema=schema,
+            dataset_name=schema,
+            pipeline_name=pipeline_name,
+            full_refresh=True,
+        )
 
-    # ── Error handling ───────────────────────────────────────────────────────
+        with _connect(source_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"INSERT INTO {schema}.items VALUES (2, 'B'), (3, 'C')")
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_failed_jobs_raise_airflow_exception(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
-    ):
-        mock_get_jsonb.return_value = {}
-        _setup_dlt_mocks(mock_dlt, mock_hook_cls, failed_jobs=True)
+        _run_operator(
+            source_pg,
+            target_pg,
+            table_name="items",
+            source_schema=schema,
+            dataset_name=schema,
+            pipeline_name=pipeline_name,
+            full_refresh=True,
+        )
 
-        with pytest.raises(AirflowException, match="failed jobs"):
-            _make_operator().execute({})
+        with _connect(target_pg) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT id, name FROM {schema}.items ORDER BY id")
+            rows = cur.fetchall()
 
-    @patch("plugins.operators.postgres_copy_table.PostgresHook")
-    @patch("plugins.operators.postgres_copy_table._make_resource")
-    @patch("plugins.operators.postgres_copy_table._get_jsonb_columns")
-    @patch("plugins.operators.postgres_copy_table.dlt")
-    def test_successful_run_does_not_raise(
-        self, mock_dlt, mock_get_jsonb, mock_make_resource, mock_hook_cls
-    ):
-        mock_get_jsonb.return_value = {}
-        _setup_dlt_mocks(mock_dlt, mock_hook_cls, failed_jobs=False)
-
-        # Should complete without raising
-        _make_operator().execute({})
+        assert rows == [(1, "A"), (2, "B"), (3, "C")]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -128,36 +129,27 @@ def _make_resource(
     * **Full refresh** (no ``incremental_key``): ``write_disposition="replace"``
       — the destination table is fully replaced on every run.
     """
-    gen_defaults: dict = dict(
-        _conn=source_conn_str,
-        _schema=source_schema,
-        _table=table_name,
-        _excl=exclude_cols,
-        _bs=batch_size,
-        _ikey=incremental_key,
-    )
+    # Immutable values are captured by closure so dlt's spec_from_signature
+    # never sees mutable list defaults (which dataclasses forbid).
     if incremental_key:
-        gen_defaults["cursor"] = dlt.sources.incremental(
+        _cursor_default = dlt.sources.incremental(
             incremental_key,
-            initial_value="1970-01-01T00:00:00Z",
+            initial_value=datetime(1970, 1, 1, tzinfo=timezone.utc),
             allow_external_schedulers=True,
         )
 
-    def _gen(
-        cursor=gen_defaults.get("cursor"),
-        _conn=gen_defaults["_conn"],
-        _schema=gen_defaults["_schema"],
-        _table=gen_defaults["_table"],
-        _excl=gen_defaults["_excl"],
-        _bs=gen_defaults["_bs"],
-        _ikey=gen_defaults["_ikey"],
-    ):
-        yield from _stream_table(
-            _conn, _schema, _table, _excl, _bs,
-            incremental_key=_ikey,
-            start_value=cursor.start_value if cursor else None,
-            end_value=cursor.end_value if cursor else None,
-        )
+        def _gen(cursor=_cursor_default):  # type: ignore[assignment]
+            yield from _stream_table(
+                source_conn_str, source_schema, table_name, exclude_cols, batch_size,
+                incremental_key=incremental_key,
+                start_value=cursor.start_value,
+                end_value=cursor.end_value,
+            )
+    else:
+        def _gen():  # type: ignore[misc]
+            yield from _stream_table(
+                source_conn_str, source_schema, table_name, exclude_cols, batch_size,
+            )
 
     resource_kwargs: dict = dict(
         name=table_name,
