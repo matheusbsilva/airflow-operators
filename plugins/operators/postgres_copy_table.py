@@ -54,11 +54,10 @@ def _get_jsonb_columns(
     finally:
         con.close()
 
-    exclude_set = set(exclude_cols)
     return {
         row[0]: {"data_type": "complex"}
         for row in rows
-        if row[0] not in exclude_set
+        if row[0] not in exclude_cols
     }
 
 
@@ -92,8 +91,7 @@ def _stream_table(
         else ""
     )
 
-    con = duckdb.connect()
-    try:
+    with duckdb.connect() as con:
         con.sql("INSTALL postgres; LOAD postgres;")
         con.sql(
             f"ATTACH '{source_conn_str}' AS src"
@@ -108,15 +106,8 @@ def _stream_table(
         result = con.execute(
             f"SELECT {col_selector} FROM src.{table_name} {where_clause}"
         )
-        reader = result.fetch_record_batch(rows_per_batch=batch_size)
-
-        while True:
-            try:
-                yield reader.read_next_batch()
-            except StopIteration:
-                break
-    finally:
-        con.close()
+        for batch in result.fetch_record_batch(rows_per_batch=batch_size):
+            yield batch
 
 
 def _make_resource(
@@ -145,50 +136,48 @@ def _make_resource(
     incremental_key = table_cfg.get("incremental_key")
     primary_key = table_cfg.get("primary_key", "id")
 
+    # Bind all table-specific values as default args to avoid late-binding.
+    # The cursor param is added only when incremental_key is present.
+    gen_defaults: dict = dict(
+        _conn=source_conn_str,
+        _schema=source_schema,
+        _table=table_name,
+        _excl=exclude_cols,
+        _bs=batch_size,
+        _ikey=incremental_key,
+    )
     if incremental_key:
-        # Bind all table-specific values as default args to avoid late-binding.
-        def _gen(
-            cursor=dlt.sources.incremental(
-                incremental_key,
-                initial_value="1970-01-01T00:00:00Z",
-            ),
-            _conn=source_conn_str,
-            _schema=source_schema,
-            _table=table_name,
-            _excl=exclude_cols,
-            _bs=batch_size,
-            _ikey=incremental_key,
-        ):
-            yield from _stream_table(
-                _conn, _schema, _table, _excl, _bs,
-                incremental_key=_ikey,
-                start_value=cursor.start_value,
-            )
-
-        return dlt.resource(
-            _gen,
-            name=table_name,
-            primary_key=primary_key,
-            write_disposition={"disposition": "merge", "strategy": "delete-insert"},
-            columns=jsonb_hints or None,
+        gen_defaults["cursor"] = dlt.sources.incremental(
+            incremental_key,
+            initial_value="1970-01-01T00:00:00Z",
         )
+
+    def _gen(
+        cursor=gen_defaults.get("cursor"),
+        _conn=gen_defaults["_conn"],
+        _schema=gen_defaults["_schema"],
+        _table=gen_defaults["_table"],
+        _excl=gen_defaults["_excl"],
+        _bs=gen_defaults["_bs"],
+        _ikey=gen_defaults["_ikey"],
+    ):
+        yield from _stream_table(
+            _conn, _schema, _table, _excl, _bs,
+            incremental_key=_ikey,
+            start_value=cursor.start_value if cursor else None,
+        )
+
+    resource_kwargs: dict = dict(
+        name=table_name,
+        columns=jsonb_hints or None,
+    )
+    if incremental_key:
+        resource_kwargs["primary_key"] = primary_key
+        resource_kwargs["write_disposition"] = {"disposition": "merge", "strategy": "delete-insert"}
     else:
-        # Bind all table-specific values as default args to avoid late-binding.
-        def _gen(  # type: ignore[no-redef]
-            _conn=source_conn_str,
-            _schema=source_schema,
-            _table=table_name,
-            _excl=exclude_cols,
-            _bs=batch_size,
-        ):
-            yield from _stream_table(_conn, _schema, _table, _excl, _bs)
+        resource_kwargs["write_disposition"] = "replace"
 
-        return dlt.resource(
-            _gen,
-            name=table_name,
-            write_disposition="replace",
-            columns=jsonb_hints or None,
-        )
+    return dlt.resource(_gen, **resource_kwargs)
 
 
 # ---------------------------------------------------------------------------
