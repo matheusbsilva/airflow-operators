@@ -275,7 +275,7 @@ class PostgresCopyTable(BaseOperator):
         resource = _make_resource(
             table_name=self.table_name,
             exclude_cols=self.exclude_columns,
-            incremental_key=None if self.full_refresh else self.incremental_key,
+            incremental_key=self.incremental_key,
             primary_key=self.primary_key,
             source_conn_str=source_conn_str,
             source_schema=self.source_schema,
