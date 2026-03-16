@@ -9,9 +9,11 @@ import duckdb
 import pyarrow as pa
 import yaml
 
+from airflow.datasets import Dataset
 from airflow.exceptions import AirflowException
 from airflow.models.baseoperator import BaseOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.utils.task_group import TaskGroup
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ def _stream_table(
     batch_size: int,
     incremental_key: str | None = None,
     start_value: str | None = None,
+    end_value: str | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Open an in-memory DuckDB connection, attach the source PostgreSQL database,
     and stream the table in Arrow RecordBatch chunks.
@@ -82,11 +85,13 @@ def _stream_table(
     col_selector = (
         f"* EXCLUDE ({', '.join(exclude_cols)})" if exclude_cols else "*"
     )
-    where_clause = (
-        f"WHERE {incremental_key} >= '{start_value}'"
-        if incremental_key and start_value is not None
-        else ""
-    )
+
+    conditions = []
+    if incremental_key and start_value is not None:
+        conditions.append(f"{incremental_key} >= '{start_value}'")
+    if incremental_key and end_value is not None:
+        conditions.append(f"{incremental_key} < '{end_value}'")
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     with duckdb.connect() as con:
         con.sql("INSTALL postgres; LOAD postgres;")
@@ -108,33 +113,26 @@ def _stream_table(
 
 
 def _make_resource(
-    table_cfg: dict,
+    table_name: str,
+    exclude_cols: list[str],
+    incremental_key: str | None,
+    primary_key: str,
     source_conn_str: str,
     source_schema: str,
     batch_size: int,
     jsonb_hints: dict[str, dict],
 ) -> dlt.sources.DltResource:
-    """Dynamically build a ``dlt.resource`` for a single table config entry.
+    """Dynamically build a ``dlt.resource`` for a single table.
 
     Two modes:
     * **Incremental** (``incremental_key`` present): uses dlt's delete+insert
-      merge strategy.  The cursor value is persisted atomically with data in
-      the destination DB so failed runs are safe to retry.
+      merge strategy.  ``allow_external_schedulers=True`` makes dlt defer to
+      Airflow's ``data_interval_start`` / ``data_interval_end`` as the load
+      window — Airflow owns scheduling, dlt does not persist its own cursor.
     * **Full refresh** (no ``incremental_key``): ``write_disposition="replace"``
       — the destination table is fully replaced on every run.
-
-    Uses ``dlt.resource()`` as a function call (rather than a decorator) so
-    that resources can be created inside a loop with per-table configuration.
-    Each generator captures its arguments via Python default-parameter binding
-    to avoid closure-over-loop-variable issues.
     """
-    table_name = table_cfg["table"]
-    exclude_cols = table_cfg.get("exclude_columns", [])
-    incremental_key = table_cfg.get("incremental_key")
-    primary_key = table_cfg.get("primary_key", "id")
-
     # Bind all table-specific values as default args to avoid late-binding.
-    # The cursor param is added only when incremental_key is present.
     gen_defaults: dict = dict(
         _conn=source_conn_str,
         _schema=source_schema,
@@ -147,6 +145,9 @@ def _make_resource(
         gen_defaults["cursor"] = dlt.sources.incremental(
             incremental_key,
             initial_value="1970-01-01T00:00:00Z",
+            # Defer the load window to Airflow's data_interval_start/end.
+            # dlt reads these automatically from the Airflow task context.
+            allow_external_schedulers=True,
         )
 
     def _gen(
@@ -162,6 +163,7 @@ def _make_resource(
             _conn, _schema, _table, _excl, _bs,
             incremental_key=_ikey,
             start_value=cursor.start_value if cursor else None,
+            end_value=cursor.end_value if cursor else None,
         )
 
     resource_kwargs: dict = dict(
@@ -178,138 +180,131 @@ def _make_resource(
 
 
 # ---------------------------------------------------------------------------
-# Airflow Operator
+# Airflow Operator  (single-table)
 # ---------------------------------------------------------------------------
 
 class PostgresCopyTable(BaseOperator):
-    """Copy tables from a source PostgreSQL database to a destination PostgreSQL
-    database using `dlt <https://dlthub.com/>`_ for incremental state management
-    and `DuckDB <https://duckdb.org/>`_ as the transformation and query engine.
+    """Copy a single table from a source PostgreSQL database to a destination
+    PostgreSQL database using `dlt <https://dlthub.com/>`_ for incremental
+    state management and `DuckDB <https://duckdb.org/>`_ as the query engine.
 
-    Tables to copy are defined in a YAML configuration file rather than as
-    operator parameters — add new tables simply by editing the YAML, with no
-    code changes required.
+    Intended to be instantiated once per table.  Use
+    :func:`create_postgres_copy_task_group` to create a full TaskGroup of these
+    operators from a YAML config file.
 
-    **How it works**
+    **Incremental load and Airflow scheduling**
 
-    For each table listed under *source_conn_id* in the YAML:
+    When ``incremental_key`` is set, dlt uses ``allow_external_schedulers=True``
+    so that Airflow's ``data_interval_start`` and ``data_interval_end`` control
+    the load window — no separate dlt cursor state is persisted.  This integrates
+    cleanly with Airflow's backfill and catchup mechanisms.
 
-    * DuckDB attaches the source PostgreSQL via the ``postgres`` extension and
-      streams data as Arrow RecordBatches (memory-bounded, suitable for tables
-      with hundreds of millions of rows).
-    * JSONB columns are auto-detected via ``information_schema`` and preserved
-      as ``JSONB`` in the destination.
-    * If the table has an ``incremental_key``, dlt uses a delete+insert merge
-      strategy: only rows where ``incremental_key >= last_cursor`` are fetched,
-      and matching rows in the destination are deleted then re-inserted.  The
-      cursor is stored atomically with the data in the destination — if a run
-      fails, the next run replays from the last successful cursor.
-    * Tables without an ``incremental_key`` are fully replaced on every run.
+    **Full refresh**
 
-    **YAML config format** (``config_path``)::
-
-        <airflow_connection_name>:
-          - table: <table_name>
-            incremental_key: <timestamp_column>   # optional
-            primary_key: <pk_column>              # optional, default 'id'
-            exclude_columns:                      # optional
-              - <column_name>
+    Pass ``full_refresh=True`` to replace the destination table entirely on the
+    current run, regardless of ``incremental_key``.  Useful for one-off
+    reloads or schema migrations.
 
     **Required packages**::
 
-        dlt[postgres]   duckdb   pyarrow   pyyaml
+        dlt[postgres]   duckdb   pyarrow
         apache-airflow-providers-postgres
 
     :param source_conn_id: Airflow connection ID for the source PostgreSQL database.
-        Must match a top-level key in the YAML config file.
     :param target_conn_id: Airflow connection ID for the destination PostgreSQL database.
-    :param config_path: Absolute (or Airflow-relative) path to the YAML config file.
-    :param dataset_name: Destination schema name (dlt ``dataset_name``).  Defaults
-        to ``"public"``.
-    :param source_schema: Source PostgreSQL schema to read tables from.  Defaults
-        to ``"public"``.
-    :param batch_size: Number of rows per Arrow RecordBatch when streaming large
-        tables.  Defaults to ``50_000``.
-    :param pipeline_name: dlt pipeline name used for state storage.  Defaults to
-        ``"pg_copy_<source_conn_id>"``.  Override when running multiple pipelines
-        writing to the same destination schema to avoid state conflicts.
+    :param table_name: Name of the table to copy (same name used in both source and destination).
+    :param dataset_name: Destination schema name (dlt ``dataset_name``).  Defaults to ``"public"``.
+    :param source_schema: Source PostgreSQL schema.  Defaults to ``"public"``.
+    :param incremental_key: Timestamp/datetime column used for incremental loading.
+        Omit for full-replace behaviour.
+    :param primary_key: Primary key column used for merge deduplication.  Defaults to ``"id"``.
+    :param exclude_columns: List of column names to omit from the copy.
+    :param batch_size: Rows per Arrow RecordBatch when streaming.  Defaults to ``50_000``.
+    :param pipeline_name: dlt pipeline name for state storage.  Defaults to
+        ``"pg_copy_{source_conn_id}_{table_name}"``.
+    :param full_refresh: When ``True``, forces ``write_disposition="replace"`` for this
+        run regardless of ``incremental_key``.  Defaults to ``False``.
     """
 
-    template_fields = ("source_conn_id", "target_conn_id", "config_path", "dataset_name")
+    template_fields = (
+        "source_conn_id",
+        "target_conn_id",
+        "table_name",
+        "dataset_name",
+        "full_refresh",
+    )
 
     def __init__(
         self,
         source_conn_id: str,
         target_conn_id: str,
-        config_path: str,
+        table_name: str,
         dataset_name: str = "public",
         source_schema: str = "public",
+        incremental_key: str | None = None,
+        primary_key: str = "id",
+        exclude_columns: list[str] | None = None,
         batch_size: int = 50_000,
         pipeline_name: str | None = None,
+        full_refresh: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.source_conn_id = source_conn_id
         self.target_conn_id = target_conn_id
-        self.config_path = config_path
+        self.table_name = table_name
         self.dataset_name = dataset_name
         self.source_schema = source_schema
+        self.incremental_key = incremental_key
+        self.primary_key = primary_key
+        self.exclude_columns = exclude_columns or []
         self.batch_size = batch_size
-        self.pipeline_name = pipeline_name or f"pg_copy_{source_conn_id}"
+        self.pipeline_name = pipeline_name or f"pg_copy_{source_conn_id}_{table_name}"
+        self.full_refresh = full_refresh
 
     # ------------------------------------------------------------------
 
     def execute(self, context) -> None:
-        # 1. Load YAML config and extract the table list for this source.
-        config = yaml.safe_load(Path(self.config_path).read_text())
-        tables: list[dict] = config.get(self.source_conn_id, [])
-        if not tables:
-            raise AirflowException(
-                f"No tables configured for connection '{self.source_conn_id}' "
-                f"in '{self.config_path}'."
-            )
-
-        # 2. Resolve connection URIs from Airflow connections.
+        # 1. Resolve connection URIs from Airflow connections.
         source_hook = PostgresHook(postgres_conn_id=self.source_conn_id)
         target_hook = PostgresHook(postgres_conn_id=self.target_conn_id)
         source_conn_str: str = source_hook.get_uri()
         target_conn_str: str = target_hook.get_uri()
 
-        # 3. Build dlt resources — one per table.
-        resources = []
-        for table_cfg in tables:
-            table_name = table_cfg.get("table")
-            if not table_name:
-                raise AirflowException(
-                    f"Each entry in '{self.source_conn_id}' must have a 'table' key."
-                )
-
-            exclude_cols = table_cfg.get("exclude_columns", [])
-
+        # 2. Auto-detect JSONB columns in the source.
+        jsonb_hints = _get_jsonb_columns(
+            source_conn_str, self.source_schema, self.table_name, self.exclude_columns
+        )
+        if jsonb_hints:
             self.log.info(
-                "Preparing resource for table '%s' (incremental_key=%s)",
-                table_name,
-                table_cfg.get("incremental_key", "none — full refresh"),
+                "Detected JSONB columns in '%s': %s", self.table_name, list(jsonb_hints)
             )
 
-            jsonb_hints = _get_jsonb_columns(
-                source_conn_str, self.source_schema, table_name, exclude_cols
-            )
-            if jsonb_hints:
-                self.log.info(
-                    "Detected JSONB columns in '%s': %s", table_name, list(jsonb_hints)
-                )
+        # 3. Build the dlt resource for this table.
+        self.log.info(
+            "Preparing resource for table '%s' (incremental_key=%s, full_refresh=%s)",
+            self.table_name,
+            self.incremental_key or "none — full refresh",
+            self.full_refresh,
+        )
 
-            resource = _make_resource(
-                table_cfg, source_conn_str, self.source_schema,
-                self.batch_size, jsonb_hints,
-            )
-            resources.append(resource)
+        resource = _make_resource(
+            table_name=self.table_name,
+            exclude_cols=self.exclude_columns,
+            incremental_key=None if self.full_refresh else self.incremental_key,
+            primary_key=self.primary_key,
+            source_conn_str=source_conn_str,
+            source_schema=self.source_schema,
+            batch_size=self.batch_size,
+            jsonb_hints=jsonb_hints,
+        )
 
-        # 4. Wrap resources in a dlt source.
-        @dlt.source(name=self.source_conn_id)
+        # 4. Wrap resource in a dlt source.
+        source_conn_id = self.source_conn_id
+
+        @dlt.source(name=source_conn_id)
         def _source():
-            return resources
+            return resource
 
         # 5. Configure and run the dlt pipeline.
         pipeline = dlt.pipeline(
@@ -323,9 +318,13 @@ class PostgresCopyTable(BaseOperator):
             self.pipeline_name, self.dataset_name, self.target_conn_id,
         )
 
+        run_kwargs: dict = {"loader_file_format": "csv"}
+        if self.full_refresh:
+            run_kwargs["write_disposition"] = "replace"
+
         # loader_file_format="csv" uses PostgreSQL's COPY command for bulk inserts,
         # which is significantly faster than INSERT VALUES for large datasets.
-        load_info = pipeline.run(_source(), loader_file_format="csv")
+        load_info = pipeline.run(_source(), **run_kwargs)
 
         self.log.info("Load complete:\n%s", load_info)
 
@@ -336,3 +335,95 @@ class PostgresCopyTable(BaseOperator):
                 f"dlt pipeline '{self.pipeline_name}' had failed jobs:\n"
                 + "\n".join(failed)
             )
+
+
+# ---------------------------------------------------------------------------
+# DAG-level factory  (creates a TaskGroup with one task per table)
+# ---------------------------------------------------------------------------
+
+def create_postgres_copy_task_group(
+    group_id: str,
+    source_conn_id: str,
+    target_conn_id: str,
+    config_path: str,
+    dataset_name: str = "public",
+    source_schema: str = "public",
+    batch_size: int = 50_000,
+    full_refresh: bool = False,
+) -> TaskGroup:
+    """Read a YAML config and build a :class:`TaskGroup` with one
+    :class:`PostgresCopyTable` task per table entry.
+
+    Each task is named ``copy_<table_name>`` inside the group.  On successful
+    completion each task emits an Airflow :class:`~airflow.datasets.Dataset`
+    event with URI ``postgres://<target_conn_id>/<dataset_name>/<table_name>``,
+    enabling downstream DAGs to use data-aware scheduling.
+
+    **YAML config format** (``config_path``)::
+
+        <source_conn_id>:
+          - table: <table_name>
+            incremental_key: <timestamp_column>   # optional
+            primary_key: <pk_column>              # optional, default 'id'
+            exclude_columns:                      # optional
+              - <column_name>
+
+    **DAG usage example**::
+
+        from plugins.operators.postgres_copy_table import create_postgres_copy_task_group
+
+        with DAG("pg_copy", schedule="@daily", ...):
+            create_postgres_copy_task_group(
+                group_id="copy_tables",
+                source_conn_id="source_postgres_conn",
+                target_conn_id="dest_postgres_conn",
+                config_path="/opt/airflow/include/config/tables.yml",
+                dataset_name="analytics",
+            )
+
+    :param group_id: TaskGroup identifier shown in the Airflow UI.
+    :param source_conn_id: Airflow connection ID for the source database.
+        Must match a top-level key in the YAML config.
+    :param target_conn_id: Airflow connection ID for the destination database.
+    :param config_path: Path to the YAML config file.
+    :param dataset_name: Destination schema name passed to each task.
+    :param source_schema: Source schema name passed to each task.
+    :param batch_size: Streaming batch size passed to each task.
+    :param full_refresh: When ``True`` all tasks run as full refresh,
+        ignoring ``incremental_key``.
+    :returns: The constructed :class:`~airflow.utils.task_group.TaskGroup`.
+    """
+    config = yaml.safe_load(Path(config_path).read_text())
+    tables: list[dict] = config.get(source_conn_id, [])
+    if not tables:
+        raise AirflowException(
+            f"No tables configured for connection '{source_conn_id}' "
+            f"in '{config_path}'."
+        )
+
+    with TaskGroup(group_id=group_id) as tg:
+        for table_cfg in tables:
+            table_name = table_cfg.get("table")
+            if not table_name:
+                raise AirflowException(
+                    f"Each entry under '{source_conn_id}' must have a 'table' key."
+                )
+
+            PostgresCopyTable(
+                task_id=f"copy_{table_name}",
+                source_conn_id=source_conn_id,
+                target_conn_id=target_conn_id,
+                table_name=table_name,
+                dataset_name=dataset_name,
+                source_schema=source_schema,
+                incremental_key=table_cfg.get("incremental_key"),
+                primary_key=table_cfg.get("primary_key", "id"),
+                exclude_columns=table_cfg.get("exclude_columns", []),
+                batch_size=batch_size,
+                full_refresh=full_refresh,
+                outlets=[
+                    Dataset(f"postgres://{target_conn_id}/{dataset_name}/{table_name}")
+                ],
+            )
+
+    return tg

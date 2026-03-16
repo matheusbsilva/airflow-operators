@@ -1,20 +1,28 @@
 # DLT Postgres Copy Table Configuration
 #
+# Consumed by create_postgres_copy_task_group() at DAG parse time.
+# Each connection key produces a TaskGroup with one task per table entry.
+#
 # Structure:
 #   <airflow_connection_name>:        # Airflow connection ID for the source PostgreSQL database
 #     - table: <table_name>           # Source (and destination) table name
-#       incremental_key: <col>        # Optional. Enables incremental load (dlt merge/delete+insert).
+#       incremental_key: <col>        # Optional. Enables incremental load (dlt delete+insert merge).
 #                                     # Must be a timestamp/datetime column. Omit for full refresh.
+#                                     # The load window is controlled by Airflow's data_interval_start
+#                                     # and data_interval_end — dlt defers to the Airflow scheduler.
 #       primary_key: <col>            # Optional. Used for merge deduplication. Defaults to 'id'.
 #       exclude_columns:              # Optional. Columns to omit from the copy.
 #         - <column_name>
 #
 # Notes:
-#   - Tables with `incremental_key` use dlt's delete+insert merge strategy.
-#     State (last cursor value) is stored atomically in the destination DB.
+#   - Tables with `incremental_key` load rows where:
+#       incremental_key >= data_interval_start AND incremental_key < data_interval_end
+#     Pass full_refresh=True to create_postgres_copy_task_group() to override for a one-off reload.
 #   - Tables without `incremental_key` perform a full replace on every run.
 #   - The destination table name always matches the source table name.
 #   - JSONB columns are automatically detected and preserved as JSONB in the destination.
+#   - On success, each task emits a Dataset event:
+#       postgres://<target_conn_id>/<dataset_name>/<table_name>
 
 source_postgres_conn:
   - table: orders
